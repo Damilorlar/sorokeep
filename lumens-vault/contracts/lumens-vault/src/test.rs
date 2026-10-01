@@ -503,12 +503,31 @@ fn install_new_wasm(env: &Env) -> BytesN<32> {
     env.deployer().upload_contract_wasm(new_contract::WASM)
 }
 
+/// Starting ledger for the upgrade tests.
+///
+/// This pin is **load-bearing, not a flake workaround** — see ADR 0008
+/// (`docs/adr/0008-upgrade-test-flake.md`), which investigated the
+/// reported one-off failure of `test_real_upgrade_and_state_migration`.
+/// It found no reproducible nondeterminism, and established instead that
+/// the pin provides the value the migration assertion checks against:
+/// the fixture's `get_vault` stamps `last_touched_ledger` with the ledger
+/// it is served at, so a `0` here would make the assertion compare `0`
+/// to `0` and pass vacuously (ADR 0008, Experiment C: the pin removed
+/// fails 20/20).
+///
+/// The value must be at least 1 so the stamped ledger is distinguishable
+/// from an untouched/default value. `1000` is otherwise arbitrary: it is
+/// comfortably above 0 and small enough that the `+11` ledger advances
+/// the other tests perform cannot realistically reach it by accident.
+const UPGRADE_TEST_START_LEDGER: u32 = 1000;
+
 #[test]
 fn test_real_upgrade_and_state_migration() {
     let env = Env::default();
     // blanket mock is fine: test is about upgrades and migration, not access control
     env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 1000);
+    env.ledger()
+        .with_mut(|l| l.sequence_number = UPGRADE_TEST_START_LEDGER);
 
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
@@ -549,7 +568,13 @@ fn test_real_upgrade_and_state_migration() {
     // `last_touched_ledger` only exists on VaultEntryV2 — its presence at
     // all is part of the proof that migration, not just a raw byte
     // round-trip, actually happened.
-    assert!(migrated.last_touched_ledger > 0);
+    //
+    // E05-02: the fixture stamps this field with the ledger the read is
+    // served at, so asserting equality against the pinned start ledger
+    // states *why* the pin matters instead of leaving a bare `> 0` that
+    // silently becomes `0 > 0` if anyone removes it. See
+    // `UPGRADE_TEST_START_LEDGER` and ADR 0008.
+    assert_eq!(migrated.last_touched_ledger, UPGRADE_TEST_START_LEDGER);
 }
 
 // ---------------------------------------------------------------------
