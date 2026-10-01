@@ -977,6 +977,128 @@ fn test_deposit_with_insufficient_balance_creates_no_vault() {
 // (timelock, insufficient balance) moves no tokens and changes no balance.
 // ---------------------------------------------------------------------
 
+// =====================================================================
+// E05-17 — the upgrade preserves vault balances across many entries
+// =====================================================================
+//
+// The existing upgrade test migrates a single vault. The real risk in an
+// upgrade is a partial or inconsistent migration across many entries,
+// which one entry cannot reveal. This creates six vaults across two
+// users and two assets, at three different ledger sequences, and checks
+// every one survives the bytecode swap.
+// ---------------------------------------------------------------------
+#[test]
+fn test_upgrade_preserves_every_vault_across_many_entries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // A non-zero starting ledger, for the same reason ADR 0008 gives for the
+    // single-vault upgrade test: the fixture stamps `last_touched_ledger` with
+    // the ledger it is served at, so a sequence well above 0 keeps that stamp
+    // distinguishable from a default and leaves room for the advances below.
+    env.ledger().with_mut(|l| l.sequence_number = 1000);
+
+    let admin = Address::generate(&env);
+    let user_a = Address::generate(&env);
+    let user_b = Address::generate(&env);
+    let vault_client = setup(&env, &admin, 10);
+
+    let token_admin = Address::generate(&env);
+    let (asset_1_client, asset_1) = create_token_contract(&env, &token_admin);
+    let (asset_2_client, asset_2) = create_token_contract(&env, &token_admin);
+    asset_1.mint(&user_a, &10_000);
+    asset_1.mint(&user_b, &10_000);
+    asset_2.mint(&user_a, &10_000);
+    asset_2.mint(&user_b, &10_000);
+    vault_client.add_asset(&asset_1_client.address);
+    vault_client.add_asset(&asset_2_client.address);
+
+    // Six vaults: two users, two assets, three distinct ledger sequences so
+    // the unlock_ledgers are not all identical. Vault ids are allocated per
+    // user, so each user's three deposits take ids 1, 2 and 3 regardless of
+    // which asset they are in.
+    vault_client.deposit(&user_a, &asset_1_client.address, &100); // A/asset_1/1
+    vault_client.deposit(&user_a, &asset_2_client.address, &200); // A/asset_2/2
+    env.ledger().with_mut(|l| l.sequence_number += 7);
+    vault_client.deposit(&user_a, &asset_1_client.address, &300); // A/asset_1/3
+    vault_client.deposit(&user_b, &asset_1_client.address, &400); // B/asset_1/1
+    env.ledger().with_mut(|l| l.sequence_number += 5);
+    vault_client.deposit(&user_b, &asset_2_client.address, &500); // B/asset_2/2
+    vault_client.deposit(&user_b, &asset_2_client.address, &600); // B/asset_2/3
+
+    assert_eq!(vault_client.get_user_vault_count(&user_a), 3);
+    assert_eq!(vault_client.get_user_vault_count(&user_b), 3);
+
+    // Snapshot every entry through the OLD binary before the swap.
+    let a_1_1 = vault_client.get_vault(&user_a, &asset_1_client.address, &1);
+    let a_2_2 = vault_client.get_vault(&user_a, &asset_2_client.address, &2);
+    let a_1_3 = vault_client.get_vault(&user_a, &asset_1_client.address, &3);
+    let b_1_1 = vault_client.get_vault(&user_b, &asset_1_client.address, &1);
+    let b_2_2 = vault_client.get_vault(&user_b, &asset_2_client.address, &2);
+    let b_2_3 = vault_client.get_vault(&user_b, &asset_2_client.address, &3);
+
+    let contract_address = vault_client.address.clone();
+    assert_eq!(vault_client.version(), 1);
+
+    let new_wasm_hash = install_new_wasm(&env);
+    vault_client.upgrade(&new_wasm_hash);
+
+    // The bytecode really swapped, and the address really did not.
+    assert_eq!(vault_client.version(), 2);
+    assert_eq!(
+        vault_client.address, contract_address,
+        "an upgrade must not change the contract address"
+    );
+
+    // Every vault is readable through the NEW binary with its exact
+    // pre-upgrade balance and unlock_ledger.
+    let new_client = new_contract::Client::new(&env, &contract_address);
+
+    let m = new_client.get_vault(&user_a, &asset_1_client.address, &1);
+    assert_eq!(m.amount, 100);
+    assert_eq!(m.unlock_ledger, a_1_1.unlock_ledger);
+
+    let m = new_client.get_vault(&user_a, &asset_2_client.address, &2);
+    assert_eq!(m.amount, 200);
+    assert_eq!(m.unlock_ledger, a_2_2.unlock_ledger);
+
+    let m = new_client.get_vault(&user_a, &asset_1_client.address, &3);
+    assert_eq!(m.amount, 300);
+    assert_eq!(m.unlock_ledger, a_1_3.unlock_ledger);
+
+    let m = new_client.get_vault(&user_b, &asset_1_client.address, &1);
+    assert_eq!(m.amount, 400);
+    assert_eq!(m.unlock_ledger, b_1_1.unlock_ledger);
+
+    let m = new_client.get_vault(&user_b, &asset_2_client.address, &2);
+    assert_eq!(m.amount, 500);
+    assert_eq!(m.unlock_ledger, b_2_2.unlock_ledger);
+
+    let m = new_client.get_vault(&user_b, &asset_2_client.address, &3);
+    assert_eq!(m.amount, 600);
+    assert_eq!(m.unlock_ledger, b_2_3.unlock_ledger);
+
+    // UserVaultCount is intact for each user. The v2 fixture deliberately
+    // exports only `version` and `get_vault`, so this is read straight from
+    // storage rather than through a client call the new binary does not
+    // have — which also makes it a direct check that the entry itself
+    // survived the swap, not just that some call still answers.
+    let count_a: u32 = env.as_contract(&contract_address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserVaultCount(user_a.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(count_a, 3, "UserVaultCount for user A must survive the upgrade");
+
+    let count_b: u32 = env.as_contract(&contract_address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserVaultCount(user_b.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(count_b, 3, "UserVaultCount for user B must survive the upgrade");
+}
+
 #[test]
 fn test_withdraw_success_keeps_stored_and_token_balances_consistent() {
     let env = Env::default();
