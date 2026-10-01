@@ -129,6 +129,76 @@ fn test_withdraw_rejects_non_positive_amount() {
     assert_eq!(entry.amount, 500);
 }
 
+// =====================================================================
+// E03-06 — withdraw extends the TTL of exactly the entries it touches
+// (NFR-5)
+// =====================================================================
+//
+// The withdraw counterpart to E03-05. The interesting part is an
+// asymmetry that is easy to mistake for a bug: withdraw extends the
+// Vault entry it reads but deliberately leaves UserVaultCount alone,
+// because withdraw allocates no id. That asymmetry is pinned here so it
+// stays a decision rather than becoming an accident.
+// ---------------------------------------------------------------------
+#[test]
+fn test_withdraw_extends_ttl_of_only_the_entries_it_touches() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let vault_client = setup(&env, &admin, 10);
+
+    let token_admin = Address::generate(&env);
+    let (token_client, token_asset) = create_token_contract(&env, &token_admin);
+    token_asset.mint(&user, &10_000);
+    vault_client.add_asset(&token_client.address);
+
+    // Two vaults for the same user, so there is a second Vault entry that
+    // the withdrawal must not touch.
+    vault_client.deposit(&user, &token_client.address, &100);
+    env.ledger().with_mut(|l| l.sequence_number += 5);
+    vault_client.deposit(&user, &token_client.address, &50);
+
+    let vault_1_key = DataKey::Vault(user.clone(), token_client.address.clone(), 1);
+    let vault_2_key = DataKey::Vault(user.clone(), token_client.address.clone(), 2);
+    let count_key = DataKey::UserVaultCount(user.clone());
+
+    let persistent_ttl = |key: &DataKey| {
+        env.as_contract(&vault_client.address, || {
+            env.storage().persistent().get_ttl(key)
+        })
+    };
+
+    let remaining = persistent_ttl(&vault_1_key);
+    env.ledger()
+        .with_mut(|l| l.sequence_number += remaining - 1000);
+
+    let vault_1_before = persistent_ttl(&vault_1_key);
+    let vault_2_before = persistent_ttl(&vault_2_key);
+    let count_before = persistent_ttl(&count_key);
+
+    // Partial withdrawal so the Vault entry survives to be inspected.
+    // The ledger is long past unlock_ledger by now.
+    vault_client.withdraw(&user, &token_client.address, &1, &40);
+
+    assert!(
+        persistent_ttl(&vault_1_key) > vault_1_before,
+        "the withdrawn vault's TTL should have been extended"
+    );
+    assert_eq!(
+        persistent_ttl(&count_key),
+        count_before,
+        "withdraw must not extend UserVaultCount's TTL — it allocates no id, so it \
+         has no reason to touch the counter (intentional, not an oversight)"
+    );
+    assert_eq!(
+        persistent_ttl(&vault_2_key),
+        vault_2_before,
+        "withdraw extended the TTL of an unrelated vault — NFR-5 regression"
+    );
+}
+
 #[test]
 fn test_user_vault_count_ttl_is_extended_on_deposit() {
     // The user vault counter is refreshed on each deposit. Without this,
