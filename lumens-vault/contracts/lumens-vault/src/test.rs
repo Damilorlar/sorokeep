@@ -1271,6 +1271,194 @@ fn test_add_asset_rejects_non_admin_and_leaves_asset_unlisted() {
     );
 }
 
+// =====================================================================
+// E04-08 — deposit and withdraw require the funds owner's authorization
+// =====================================================================
+//
+// `deposit` calls `from.require_auth()` and `withdraw` calls
+// `to.require_auth()`. These guard user funds directly: without the
+// withdraw check, anyone could name another user's address and drain
+// their matured vault.
+// ---------------------------------------------------------------------
+
+/// `try_deposit`'s nested result: outer = did the invocation succeed,
+/// inner `Ok` = the decoded return value, inner `Err` = typed contract
+/// `Error` vs host `InvokeError`.
+type DepositCallResult = Result<Result<u32, ConversionError>, Result<Error, InvokeError>>;
+
+/// `deposit(from, asset, amount)` authorized by exactly `signer`. When
+/// `signer != from` this is the "someone else authorizes it" case.
+fn deposit_authorized_by(
+    env: &Env,
+    vault: &LumensVaultClient,
+    signer: &Address,
+    from: &Address,
+    asset: &Address,
+    amount: i128,
+) -> DepositCallResult {
+    // `deposit` also performs the token transfer in the same call, and that
+    // nested `transfer` requires the sender's authorization as well — so the
+    // auth entry has to cover both invocations, not only the outer one.
+    let transfer_sub_invoke = MockAuthInvoke {
+        contract: asset,
+        fn_name: "transfer",
+        args: (from.clone(), vault.address.clone(), amount).into_val(env),
+        sub_invokes: &[],
+    };
+    let sub_invokes = [transfer_sub_invoke];
+    let invoke = MockAuthInvoke {
+        contract: &vault.address,
+        fn_name: "deposit",
+        args: (from.clone(), asset.clone(), amount).into_val(env),
+        sub_invokes: &sub_invokes,
+    };
+    let auths = [MockAuth {
+        address: signer,
+        invoke: &invoke,
+    }];
+    vault
+        .mock_auths(&auths)
+        .try_deposit(from, asset, &amount)
+}
+
+/// `withdraw(to, asset, vault_id, amount)` authorized by exactly `signer`.
+fn withdraw_authorized_by(
+    env: &Env,
+    vault: &LumensVaultClient,
+    signer: &Address,
+    to: &Address,
+    asset: &Address,
+    vault_id: u32,
+    amount: i128,
+) -> WhitelistCallResult {
+    let invoke = MockAuthInvoke {
+        contract: &vault.address,
+        fn_name: "withdraw",
+        args: (to.clone(), asset.clone(), vault_id, amount).into_val(env),
+        sub_invokes: &[],
+    };
+    let auths = [MockAuth {
+        address: signer,
+        invoke: &invoke,
+    }];
+    vault
+        .mock_auths(&auths)
+        .try_withdraw(to, asset, &vault_id, &amount)
+}
+
+fn assert_deposit_authorized(result: DepositCallResult, what: &str) -> u32 {
+    match result {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => panic!("{what} succeeded but its return value failed to decode: {e:?}"),
+        Err(Ok(e)) => panic!("{what} was authorized but the contract rejected it: {e:?}"),
+        Err(Err(e)) => panic!("{what} failed at the host level: {e:?} — check the mocked auth"),
+    }
+}
+
+fn assert_deposit_unauthorized(result: DepositCallResult) {
+    match result {
+        Err(Err(InvokeError::Abort)) => {}
+        Err(Ok(e)) => panic!(
+            "expected an authorization failure, but the contract returned its own error: {e:?} \
+             — that means the call was authorized and failed for a different reason"
+        ),
+        Err(Err(other)) => panic!("expected InvokeError::Abort, got {other:?}"),
+        Ok(_) => panic!("expected an authorization failure, but the call succeeded"),
+    }
+}
+
+#[test]
+fn test_deposit_and_withdraw_require_the_funds_owners_authorization() {
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    // Setup runs under blanket mocks (the constructor and the token mint
+    // both need real authorization); every call under test runs with only
+    // the auth it is explicitly given.
+    env.mock_all_auths();
+    let vault_client = setup(&env, &admin, 10);
+    let token_admin = Address::generate(&env);
+    let (token_client, token_asset) = create_token_contract(&env, &token_admin);
+    token_asset.mint(&owner, &1000);
+    vault_client.add_asset(&token_client.address);
+    env.set_auths(&[]);
+
+    // 1. A deposit authorized by someone other than `from` fails, and no
+    //    vault is created.
+    assert_deposit_unauthorized(deposit_authorized_by(
+        &env,
+        &vault_client,
+        &attacker,
+        &owner,
+        &token_client.address,
+        100,
+    ));
+    assert_eq!(
+        vault_client.get_user_vault_count(&owner),
+        0,
+        "a deposit whose authorization came from the wrong address must create no vault"
+    );
+    assert_eq!(token_client.balance(&vault_client.address), 0);
+
+    // 2. The owner's own authorized deposit succeeds — the negative case
+    //    above is not just a broken setup.
+    let vault_id = assert_deposit_authorized(
+        deposit_authorized_by(
+            &env,
+            &vault_client,
+            &owner,
+            &owner,
+            &token_client.address,
+            100,
+        ),
+        "the owner's deposit",
+    );
+    assert_eq!(vault_id, 1);
+    assert_eq!(vault_client.get_user_vault_count(&owner), 1);
+
+    // Mature the lock so the timelock is not what rejects the next call.
+    env.ledger().with_mut(|l| l.sequence_number += 11);
+
+    // 3. A withdrawal authorized by someone other than the vault owner
+    //    fails. Without this check anyone could name another user's
+    //    address and drain their matured vault.
+    assert_unauthorized(withdraw_authorized_by(
+        &env,
+        &vault_client,
+        &attacker,
+        &owner,
+        &token_client.address,
+        1,
+        50,
+    ));
+    assert_eq!(
+        vault_client.get_vault(&owner, &token_client.address, &1).amount,
+        100,
+        "a rejected withdrawal must leave the balance untouched"
+    );
+    assert_eq!(token_client.balance(&vault_client.address), 100);
+    assert_eq!(token_client.balance(&owner), 900);
+
+    // 4. The owner's own authorized withdrawal succeeds.
+    assert_authorized(
+        withdraw_authorized_by(
+            &env,
+            &vault_client,
+            &owner,
+            &owner,
+            &token_client.address,
+            1,
+            50,
+        ),
+        "the owner's withdrawal",
+    );
+    assert_eq!(token_client.balance(&owner), 950);
+    assert_eq!(token_client.balance(&vault_client.address), 50);
+}
+
 #[test]
 fn test_remove_asset_rejects_non_admin_and_leaves_asset_whitelisted() {
     let env = Env::default();
