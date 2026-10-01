@@ -3,7 +3,10 @@
 
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
 use soroban_sdk::{
-    testutils::{storage::Persistent, Address as _, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{
+        storage::{Instance, Persistent},
+        Address as _, Ledger, MockAuth, MockAuthInvoke,
+    },
     Address, BytesN, ConversionError, Env, IntoVal, InvokeError,
 };
 
@@ -164,6 +167,87 @@ fn test_user_vault_count_ttl_is_extended_on_deposit() {
     assert!(
         ttl_after_second_deposit > 1000,
         "UserVaultCount TTL was not refreshed on the second deposit — it would archive soon"
+    );
+}
+
+// =====================================================================
+// E03-05 — deposit extends the TTL of exactly the entries it touches
+// (NFR-5)
+// =====================================================================
+//
+// NFR-5 says a function extends the TTL only of the entries it actually
+// touches, with the deployed guard as the backstop for dormant ones.
+// Both directions of that failure are silent: an over-eager bump pays
+// rent forever for entries nobody reads, and a missing bump archives an
+// entry that is still live. Nothing else in the suite would catch
+// either, so the property is pinned here directly.
+// ---------------------------------------------------------------------
+#[test]
+fn test_deposit_extends_ttl_of_only_the_entries_it_touches() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let vault_client = setup(&env, &admin, 10);
+
+    let token_admin = Address::generate(&env);
+    let (token_client, token_asset) = create_token_contract(&env, &token_admin);
+    token_asset.mint(&user, &10_000);
+    vault_client.add_asset(&token_client.address);
+
+    // First deposit creates vault #1. This is the entry the *second*
+    // deposit must leave completely alone.
+    vault_client.deposit(&user, &token_client.address, &100);
+
+    let vault_1_key = DataKey::Vault(user.clone(), token_client.address.clone(), 1);
+    let vault_2_key = DataKey::Vault(user.clone(), token_client.address.clone(), 2);
+    let count_key = DataKey::UserVaultCount(user.clone());
+
+    let persistent_ttl = |key: &DataKey| {
+        env.as_contract(&vault_client.address, || {
+            env.storage().persistent().get_ttl(key)
+        })
+    };
+    let instance_ttl = || {
+        env.as_contract(&vault_client.address, || {
+            env.storage().instance().get_ttl()
+        })
+    };
+
+    // Move the ledger close to archiving. `extend_ttl` only acts once the
+    // remaining TTL has dropped below the lifetime threshold, so without
+    // this the second deposit would be a no-op for every entry and the
+    // test would pass without exercising anything.
+    let remaining = persistent_ttl(&vault_1_key);
+    env.ledger()
+        .with_mut(|l| l.sequence_number += remaining - 1000);
+
+    let vault_1_before = persistent_ttl(&vault_1_key);
+    let count_before = persistent_ttl(&count_key);
+    let instance_before = instance_ttl();
+
+    // Second deposit for the same user: allocates vault #2 and touches
+    // UserVaultCount plus instance storage via check_paused and
+    // check_whitelisted. Vault #1 is not part of this call at all.
+    vault_client.deposit(&user, &token_client.address, &50);
+
+    assert_eq!(
+        persistent_ttl(&vault_1_key),
+        vault_1_before,
+        "deposit extended the TTL of a vault it never touched — NFR-5 regression"
+    );
+    assert!(
+        persistent_ttl(&vault_2_key) > vault_1_before,
+        "the vault created by the deposit should have had its TTL extended"
+    );
+    assert!(
+        persistent_ttl(&count_key) > count_before,
+        "UserVaultCount is written by deposit and its TTL should have been extended"
+    );
+    assert!(
+        instance_ttl() > instance_before,
+        "instance storage is touched via check_paused/check_whitelisted and its TTL should have been extended"
     );
 }
 
