@@ -357,6 +357,68 @@ fn test_delisting_blocks_deposits_but_never_traps_existing_funds() {
     assert_eq!(token_client.balance(&user), 1000);
 }
 
+// =====================================================================
+// E03-10 — partial withdrawal leaves the remainder locked under the
+// same terms (FR-3)
+// =====================================================================
+//
+// FR-3 supports partial withdrawal with the remainder staying locked
+// under the original terms. The property that actually matters is that
+// `unlock_ledger` is not recomputed: a partial withdrawal must neither
+// silently re-lock funds for another full term nor quietly unlock them.
+// ---------------------------------------------------------------------
+#[test]
+fn test_partial_withdrawal_leaves_remainder_locked_under_the_same_terms() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let vault_client = setup(&env, &admin, 10);
+
+    let token_admin = Address::generate(&env);
+    let (token_client, token_asset) = create_token_contract(&env, &token_admin);
+    token_asset.mint(&user, &1000);
+    vault_client.add_asset(&token_client.address);
+
+    vault_client.deposit(&user, &token_client.address, &100);
+
+    let original = vault_client.get_vault(&user, &token_client.address, &1);
+    assert_eq!(original.amount, 100);
+
+    // Mature the lock exactly.
+    env.ledger()
+        .with_mut(|l| l.sequence_number = original.unlock_ledger);
+
+    vault_client.withdraw(&user, &token_client.address, &1, &40);
+
+    let remainder = vault_client.get_vault(&user, &token_client.address, &1);
+    assert_eq!(remainder.amount, 60, "the entry should hold exactly the remainder");
+    assert_eq!(
+        remainder.unlock_ledger, original.unlock_ledger,
+        "a partial withdrawal must not move unlock_ledger — the remainder stays \
+         locked under the terms it was deposited with (FR-3)"
+    );
+    assert_eq!(token_client.balance(&user), 940);
+    assert_eq!(token_client.balance(&vault_client.address), 60);
+
+    // Withdrawing the remainder reaches zero and the entry is removed,
+    // matching the zero-balance decision from E03-02.
+    vault_client.withdraw(&user, &token_client.address, &1, &60);
+
+    assert!(
+        vault_client.try_get_vault(&user, &token_client.address, &1).is_err(),
+        "a zero-balance vault is removed rather than kept as an empty entry"
+    );
+    assert_eq!(token_client.balance(&user), 1000);
+    assert_eq!(token_client.balance(&vault_client.address), 0);
+    assert_eq!(
+        vault_client.get_user_vault_count(&user),
+        1,
+        "the id allocator is monotonic — removing a drained vault does not return its id"
+    );
+}
+
 // ---------------------------------------------------------------------
 // E05-06 — Pause semantics (FR-5, FR-10, NFR-2).
 //
