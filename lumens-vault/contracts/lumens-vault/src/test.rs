@@ -872,6 +872,112 @@ fn test_admin_can_add_and_remove_asset() {
     );
 }
 
+// =====================================================================
+// E04-05 — transfer_admin, and the old admin genuinely loses access
+// =====================================================================
+//
+// Under `mock_all_auths()` every `require_auth()` succeeds, so no earlier
+// test could have shown that a transfer actually *revokes* anything — the
+// previous admin's calls would have kept working. With scoped auth the
+// claim becomes testable, and it is the most important admin test here:
+// a transfer that does not revoke is a silent two-admin contract.
+// ---------------------------------------------------------------------
+
+/// `transfer_admin` authorized by exactly `signer`, and nothing else.
+fn transfer_admin_as(
+    env: &Env,
+    vault: &LumensVaultClient,
+    signer: &Address,
+    new_admin: &Address,
+) -> WhitelistCallResult {
+    let invoke = MockAuthInvoke {
+        contract: &vault.address,
+        fn_name: "transfer_admin",
+        args: (new_admin.clone(),).into_val(env),
+        sub_invokes: &[],
+    };
+    let auths = [MockAuth {
+        address: signer,
+        invoke: &invoke,
+    }];
+    vault.mock_auths(&auths).try_transfer_admin(new_admin)
+}
+
+#[test]
+fn test_transfer_admin_revokes_the_previous_admins_access() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let (vault_client, _asset) = setup_whitelist_fixture(&env, &admin);
+
+    let new_admin = Address::generate(&env);
+    let never_admin = Address::generate(&env);
+
+    // Plain contract addresses are enough for `add_asset`: it writes a bool
+    // and never calls the asset, so no token contract is needed.
+    let asset_for_new_admin = Address::generate(&env);
+    let asset_for_old_admin = Address::generate(&env);
+    let asset_for_never_admin = Address::generate(&env);
+
+    // 1. The sitting admin hands over.
+    assert_authorized(
+        transfer_admin_as(&env, &vault_client, &admin, &new_admin),
+        "the admin's transfer_admin",
+    );
+    assert_eq!(
+        vault_client.get_admin_address(),
+        new_admin,
+        "get_admin_address should return the new admin after a transfer"
+    );
+
+    // 2. The new admin can perform an admin action. `add_asset` takes no
+    //    caller argument, so the signed auth entry *is* the caller.
+    assert_authorized(
+        whitelist_call_as(&env, &vault_client, &new_admin, "add_asset", &asset_for_new_admin),
+        "the new admin's add_asset",
+    );
+    assert!(vault_client.is_whitelisted(&asset_for_new_admin));
+
+    // 3. The previous admin is now a non-admin, and their next admin call
+    //    must fail. Observed failure: `Err(Err(InvokeError::Abort))` — the
+    //    host rejects the missing authorization before the contract's own
+    //    error path is reachable, so this is not and cannot be an `Error`
+    //    variant. `assert_unauthorized` pins that exact shape.
+    assert_unauthorized(whitelist_call_as(
+        &env,
+        &vault_client,
+        &admin,
+        "add_asset",
+        &asset_for_old_admin,
+    ));
+    assert!(
+        !vault_client.is_whitelisted(&asset_for_old_admin),
+        "the old admin's rejected call must not take effect"
+    );
+
+    // 4. A third address that was never admin also fails.
+    assert_unauthorized(whitelist_call_as(
+        &env,
+        &vault_client,
+        &never_admin,
+        "add_asset",
+        &asset_for_never_admin,
+    ));
+    assert!(!vault_client.is_whitelisted(&asset_for_never_admin));
+
+    // 5. transfer_admin by a non-admin fails and leaves the admin
+    //    unchanged — including the old admin, who must not be able to
+    //    simply take the role back.
+    assert_unauthorized(transfer_admin_as(&env, &vault_client, &never_admin, &never_admin));
+    assert_eq!(vault_client.get_admin_address(), new_admin);
+
+    assert_unauthorized(transfer_admin_as(&env, &vault_client, &admin, &admin));
+    assert_eq!(
+        vault_client.get_admin_address(),
+        new_admin,
+        "the old admin must not be able to transfer the role back to itself"
+    );
+}
+
 #[test]
 fn test_add_asset_rejects_non_admin_and_leaves_asset_unlisted() {
     let env = Env::default();
