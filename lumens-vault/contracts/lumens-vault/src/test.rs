@@ -288,6 +288,57 @@ fn test_withdraw_of_matured_vault_fails_while_paused() {
     assert_eq!(token_client.balance(&vault_client.address), 500);
 }
 
+// =====================================================================
+// E05-11 — withdrawal at the exact unlock ledger boundary
+// =====================================================================
+//
+// The guard is `sequence < unlock_ledger` → TimelockNotExpired, so a
+// vault is withdrawable *at* unlock_ledger, inclusively. That is a
+// deliberate boundary choice with a one-character alternative (`<=`),
+// and no mid-range test would catch it being flipped.
+//
+// `docs/contract-interface.md` already states this same boundary under
+// "Semantics the frontend and backend depend on", so the documented
+// contract and this test now agree.
+// ---------------------------------------------------------------------
+#[test]
+fn test_withdraw_is_allowed_at_exactly_unlock_ledger_and_rejected_one_ledger_before() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let vault_client = setup(&env, &admin, 10);
+
+    let token_admin = Address::generate(&env);
+    let (token_client, token_asset) = create_token_contract(&env, &token_admin);
+    token_asset.mint(&user, &1000);
+    vault_client.add_asset(&token_client.address);
+
+    vault_client.deposit(&user, &token_client.address, &100);
+    let unlock_ledger = vault_client
+        .get_vault(&user, &token_client.address, &1)
+        .unlock_ledger;
+
+    // One ledger early: still locked.
+    env.ledger()
+        .with_mut(|l| l.sequence_number = unlock_ledger - 1);
+    let too_early = vault_client.try_withdraw(&user, &token_client.address, &1, &50);
+    assert_eq!(
+        too_early,
+        Err(Ok(Error::TimelockNotExpired)),
+        "withdrawing one ledger before unlock_ledger must fail with TimelockNotExpired"
+    );
+    assert_eq!(token_client.balance(&user), 900);
+
+    // Exactly at unlock_ledger: allowed. The boundary is inclusive.
+    env.ledger()
+        .with_mut(|l| l.sequence_number = unlock_ledger);
+    vault_client.withdraw(&user, &token_client.address, &1, &50);
+    assert_eq!(token_client.balance(&user), 950);
+    assert_eq!(token_client.balance(&vault_client.address), 50);
+}
+
 #[test]
 fn test_deposit_and_withdraw_succeed_after_unpause() {
     let env = Env::default();
