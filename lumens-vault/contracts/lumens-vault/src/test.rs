@@ -503,6 +503,65 @@ fn install_new_wasm(env: &Env) -> BytesN<32> {
     env.deployer().upload_contract_wasm(new_contract::WASM)
 }
 
+// =====================================================================
+// E04-07 — upgrade rejects an unauthorized caller
+// =====================================================================
+//
+// `upgrade` replaces the entire running bytecode. It is the
+// highest-consequence entry point in the contract: whoever can call it
+// owns the vault and everything in it. This pins the guard, and proves
+// it is the guard rather than a broken call path by having the admin
+// perform the identical call successfully afterwards.
+// ---------------------------------------------------------------------
+
+/// `upgrade` authorized by exactly `signer`, and nothing else.
+fn upgrade_as(
+    env: &Env,
+    vault: &LumensVaultClient,
+    signer: &Address,
+    new_wasm_hash: &BytesN<32>,
+) -> WhitelistCallResult {
+    let invoke = MockAuthInvoke {
+        contract: &vault.address,
+        fn_name: "upgrade",
+        args: (new_wasm_hash.clone(),).into_val(env),
+        sub_invokes: &[],
+    };
+    let auths = [MockAuth {
+        address: signer,
+        invoke: &invoke,
+    }];
+    vault.mock_auths(&auths).try_upgrade(new_wasm_hash)
+}
+
+#[test]
+fn test_upgrade_rejects_an_unauthorized_caller() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let (vault_client, _asset) = setup_whitelist_fixture(&env, &admin);
+
+    // A validly uploaded wasm hash — the attacker is not guessing at a
+    // bad input, they are replaying the admin's own call.
+    let new_wasm_hash = install_new_wasm(&env);
+    assert_eq!(vault_client.version(), 1);
+
+    assert_unauthorized(upgrade_as(&env, &vault_client, &attacker, &new_wasm_hash));
+    assert_eq!(
+        vault_client.version(),
+        1,
+        "the bytecode must be unchanged after a rejected upgrade"
+    );
+
+    // Positive control: the admin's identical call succeeds, so the test
+    // is proving the authorization guard and not a broken call path.
+    assert_authorized(
+        upgrade_as(&env, &vault_client, &admin, &new_wasm_hash),
+        "the admin's upgrade",
+    );
+    assert_eq!(vault_client.version(), 2);
+}
+
 #[test]
 fn test_real_upgrade_and_state_migration() {
     let env = Env::default();
