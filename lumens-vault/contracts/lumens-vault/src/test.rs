@@ -682,6 +682,81 @@ fn test_withdraw_success_keeps_stored_and_token_balances_consistent() {
     assert_eq!(user_bal + vault_bal, 1000);
 }
 
+// =====================================================================
+// E05-23 — the contract takes no fee on any path (FR-6)
+// =====================================================================
+//
+// FR-6 states there are no protocol fees in v1. That is currently true
+// only because nobody wrote any, which is not the same as being enforced:
+// a negative requirement with no test erodes the first time someone adds
+// a small skim during a later feature. Pinned here while it is trivially
+// true.
+// ---------------------------------------------------------------------
+#[test]
+fn test_vault_takes_no_fee_on_any_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let vault_client = setup(&env, &admin, 10);
+
+    let token_admin = Address::generate(&env);
+    let (token_client, token_asset) = create_token_contract(&env, &token_admin);
+    token_asset.mint(&user, &2000);
+    vault_client.add_asset(&token_client.address);
+
+    // Full round trip. What leaves the user's account must be exactly what
+    // comes back, and the contract must hold nothing afterwards.
+    let user_before = token_client.balance(&user);
+    vault_client.deposit(&user, &token_client.address, &1000);
+
+    let deposited = vault_client.get_vault(&user, &token_client.address, &1);
+    assert_eq!(
+        deposited.amount, 1000,
+        "the vault recorded less than was deposited — a fee was withheld on deposit"
+    );
+    assert_eq!(token_client.balance(&vault_client.address), 1000);
+    assert_eq!(token_client.balance(&user), user_before - 1000);
+
+    env.ledger().with_mut(|l| l.sequence_number += 11);
+    vault_client.withdraw(&user, &token_client.address, &1, &1000);
+
+    assert_eq!(
+        token_client.balance(&user),
+        user_before,
+        "the round trip did not return exactly what was deposited — a fee was withheld on withdrawal"
+    );
+    assert_eq!(token_client.balance(&vault_client.address), 0);
+
+    // Partial withdrawal too: a per-withdrawal fee would be easiest to
+    // hide there, and the reconciliation across the whole round trip is
+    // what would expose it.
+    let user_before_partial = token_client.balance(&user);
+    let partial_vault_id = vault_client.deposit(&user, &token_client.address, &1000);
+    env.ledger().with_mut(|l| l.sequence_number += 11);
+    vault_client.withdraw(&user, &token_client.address, &partial_vault_id, &250);
+
+    assert_eq!(
+        token_client.balance(&user),
+        user_before_partial - 1000 + 250,
+        "a partial withdrawal returned less than was requested — a fee was withheld"
+    );
+
+    let remaining = vault_client.get_vault(&user, &token_client.address, &partial_vault_id);
+    assert_eq!(remaining.amount, 750);
+    assert_eq!(
+        token_client.balance(&vault_client.address),
+        remaining.amount,
+        "the contract holds more than the recorded balance — a fee was retained"
+    );
+    assert_eq!(
+        token_client.balance(&user) + token_client.balance(&vault_client.address),
+        user_before_partial,
+        "tokens were created or destroyed across the round trip"
+    );
+}
+
 #[test]
 fn test_withdraw_timelock_failure_moves_no_tokens_and_changes_no_balance() {
     let env = Env::default();
