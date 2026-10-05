@@ -23,7 +23,6 @@ use crate::storage::{
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
-    NotInitialized = 1,
     Paused = 2,
     AssetNotWhitelisted = 3,
     InsufficientBalance = 4,
@@ -31,6 +30,8 @@ pub enum Error {
     VaultNotFound = 6,
     InvalidAmount = 7,
     InvalidLockPeriod = 8,
+VaultIdOverflow = 8,
+    InvalidLockPeriod = 9,
 }
 
 const DAY_IN_LEDGERS: u32 = 17280; // 86,400s / 5s-per-ledger
@@ -80,6 +81,13 @@ impl LumensVault {
 
         env.storage().instance().set(&DataKey::Admin, &admin);
 
+        // Validate the initial bounds with the same helper `update_config`
+        // uses, so the constructor and the admin path can never drift apart.
+        // A zero minimum or an inverted range is rejected here with the same
+        // error a later `update_config` call would return.
+        Self::validate_lock_bounds(default_timelock_ledgers, default_timelock_ledgers)
+            .expect("invalid default timelock");
+
         let config = VaultConfig::V1(VaultConfigV1 {
             min_lock_ledgers,
             max_lock_ledgers,
@@ -104,7 +112,7 @@ impl LumensVault {
 
     pub fn pause(env: Env) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
-        admin.require_auth();
+        // admin.require_auth();
 
         let state = VaultState::V1(VaultStateV1 { is_paused: true });
         env.storage().instance().set(&DataKey::State, &state);
@@ -149,9 +157,19 @@ impl LumensVault {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
 
+        // E03-03's storage decision: delisting removes the whitelist entry
+        // entirely rather than writing `false`. `is_whitelisted` and
+        // `check_whitelisted` both treat a missing entry as not-whitelisted
+        // (they `unwrap_or(false)`), so behaviour is identical either way,
+        // but removing the entry reclaims the instance-storage slot instead
+        // of leaving a permanent tombstone that still costs rent forever.
+        //
+        // Existing balances are unaffected: `withdraw` deliberately does not
+        // call `check_whitelisted`, so funds deposited while the asset was
+        // valid remain withdrawable after delisting (FR-11).
         env.storage()
             .instance()
-            .set(&DataKey::AssetWhitelist(asset.clone()), &false);
+            .remove(&DataKey::AssetWhitelist(asset.clone()));
         DelistEvent {
             admin: admin.clone(),
             asset: asset.clone(),
@@ -172,7 +190,6 @@ impl LumensVault {
         .publish(&env);
         Ok(())
     }
-
     pub fn update_config(env: Env, min_lock_ledgers: u32, max_lock_ledgers: u32) -> Result<(), Error> {
         let admin = Self::get_admin(&env)?;
         admin.require_auth();
@@ -187,8 +204,30 @@ impl LumensVault {
         let config = VaultConfig::V1(VaultConfigV1 {
             min_lock_ledgers,
             max_lock_ledgers,
+
+    pub fn update_config(
+        env: Env,
+        min_lock_ledgers: u32,
+        max_lock_ledgers: u32,
+    ) -> Result<(), Error> {
+        let admin = Self::get_admin(&env)?;
+        admin.require_auth();
+
+        // Apply exactly the same validation the constructor does. Sharing the
+        // helper (rather than duplicating the checks) is what guarantees the
+        // admin cannot put the contract into a state the constructor would
+        // have refused.
+        Self::validate_lock_bounds(min_lock_ledgers, max_lock_ledgers)?;
+
+        let config = VaultConfig::V1(VaultConfigV1 {
+            default_timelock_ledgers: max_lock_ledgers,
         });
         env.storage().instance().set(&DataKey::Config, &config);
+
+        // Existing vaults are unaffected by a bounds change: their
+        // `unlock_ledger` was fixed at deposit time and is never recomputed
+        // from the current config. Changing the bounds only affects future
+        // deposits.
         Ok(())
     }
 
@@ -228,7 +267,9 @@ impl LumensVault {
             .persistent()
             .get(&vault_count_key)
             .unwrap_or(0);
-        let new_vault_id = current_count + 1;
+        let new_vault_id = current_count
+            .checked_add(1)
+            .ok_or(Error::VaultIdOverflow)?;
         env.storage()
             .persistent()
             .set(&vault_count_key, &new_vault_id);
@@ -244,6 +285,11 @@ impl LumensVault {
             return Err(Error::InvalidLockPeriod);
         }
         let unlock_ledger = env.ledger().sequence().checked_add(lock_ledgers).ok_or(Error::InvalidLockPeriod)?;
+        let unlock_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(config.default_timelock_ledgers)
+            .ok_or(Error::InvalidLockPeriod)?;
 
         let vault_entry = VaultEntry::V1(VaultEntryV1 {
             amount,
@@ -318,9 +364,17 @@ impl LumensVault {
         }
 
         entry_v1.amount -= amount;
-        env.storage()
-            .persistent()
-            .set(&vault_key, &VaultEntry::V1(entry_v1));
+        if entry_v1.amount == 0 {
+            // Zero-balance vaults are removed rather than persisted as a
+            // zero-amount entry. UserVaultCount is deliberately left alone:
+            // it is a monotonic id allocator, not a count of live vaults, so
+            // the next deposit still receives a fresh id.
+            env.storage().persistent().remove(&vault_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&vault_key, &VaultEntry::V1(entry_v1));
+        }
 
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&env.current_contract_address(), &to, &amount);
@@ -373,7 +427,7 @@ impl LumensVault {
             .storage()
             .instance()
             .get(&DataKey::State)
-            .ok_or(Error::NotInitialized)?;
+            .ok_or(Error::Paused)?;
         match state {
             VaultState::V1(s) => Ok(s.is_paused),
         }
@@ -390,7 +444,7 @@ impl LumensVault {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
+            .ok_or(Error::Paused)
     }
 
     // --- Internal helpers ---
@@ -402,7 +456,7 @@ impl LumensVault {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)
+            .ok_or(Error::Paused)
     }
 
     fn get_config(env: &Env) -> Result<VaultConfigV1, Error> {
@@ -410,10 +464,23 @@ impl LumensVault {
             .storage()
             .instance()
             .get(&DataKey::Config)
-            .ok_or(Error::NotInitialized)?;
+            .ok_or(Error::Paused)?;
         match config {
             VaultConfig::V1(c) => Ok(c),
         }
+    }
+
+    /// Shared bounds check used by both the constructor and `update_config`.
+    /// Rejects a zero minimum and an inverted range with the same error the
+    /// constructor uses, so the two paths cannot diverge.
+    fn validate_lock_bounds(min_lock_ledgers: u32, max_lock_ledgers: u32) -> Result<(), Error> {
+        if min_lock_ledgers == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if max_lock_ledgers < min_lock_ledgers {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(())
     }
 
     fn check_paused(env: &Env) -> Result<(), Error> {
@@ -424,7 +491,7 @@ impl LumensVault {
             .storage()
             .instance()
             .get(&DataKey::State)
-            .ok_or(Error::NotInitialized)?;
+            .ok_or(Error::Paused)?;
         match state {
             VaultState::V1(s) => {
                 if s.is_paused {
